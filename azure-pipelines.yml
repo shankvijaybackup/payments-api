@@ -1,0 +1,119 @@
+# Payments API — Azure DevOps Pipeline
+# Auto-creates Atomicwork change request on production deployments
+trigger:
+  branches:
+    include: [main]
+  paths:
+    exclude: ['*.md', 'docs/**']
+
+pr:
+  branches:
+    include: [main, develop]
+
+variables:
+  NODE_VERSION: '20.x'
+  SERVICE_NAME: 'payments-api'
+  IMAGE_TAG: '$(Build.BuildNumber)'
+
+stages:
+- stage: Build
+  displayName: 'Build & Test'
+  jobs:
+  - job: BuildTest
+    pool: { vmImage: 'ubuntu-latest' }
+    steps:
+    - task: NodeTool@0
+      inputs: { versionSpec: '$(NODE_VERSION)' }
+    - script: npm ci
+      displayName: 'Install dependencies'
+    - script: npm run lint
+      displayName: 'Lint'
+    - script: npm test -- --coverage --ci
+      displayName: 'Unit tests'
+    - task: PublishTestResults@2
+      inputs: { testResultsFormat: 'JUnit', testResultsFiles: '**/junit.xml' }
+    - task: PublishCodeCoverageResults@1
+      inputs: { codeCoverageTool: 'Cobertura', summaryFileLocation: 'coverage/cobertura-coverage.xml' }
+    - task: Docker@2
+      displayName: 'Build Docker image'
+      inputs:
+        command: buildAndPush
+        repository: 'atombank/payments-api'
+        tags: '$(IMAGE_TAG)\nlatest'
+    - task: PublishBuildArtifacts@1
+      inputs: { pathToPublish: 'dist', artifactName: 'payments-api-dist' }
+
+- stage: Deploy_Staging
+  displayName: 'Deploy to Staging'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - deployment: DeployStaging
+    environment: 'staging'
+    pool: { vmImage: 'ubuntu-latest' }
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "Deploying payments-api $(IMAGE_TAG) to staging"
+              kubectl set image deployment/payments-api payments-api=atombank/payments-api:$(IMAGE_TAG) -n staging
+            displayName: 'Deploy to AKS staging'
+          - script: npm run test:integration
+            displayName: 'Integration tests'
+
+- stage: Deploy_Production
+  displayName: 'Deploy to Production'
+  dependsOn: Deploy_Staging
+  condition: succeeded()
+  jobs:
+  - deployment: CreateChangeRequest
+    displayName: 'Gate: Create Atomicwork Change Request'
+    environment: 'production-gate'
+    pool: { vmImage: 'ubuntu-latest' }
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: InvokeRestAPI@1
+            displayName: 'Raise CHG in Atomicwork'
+            inputs:
+              connectionType: connectedServiceName
+              serviceConnection: 'Atomicwork-ITSM'
+              method: POST
+              headers: '{"Content-Type":"application/json"}'
+              body: |
+                {
+                  "title": "Deploy $(SERVICE_NAME) $(IMAGE_TAG) to Production",
+                  "service": "$(SERVICE_NAME)",
+                  "buildId": "$(Build.BuildId)",
+                  "buildUrl": "$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)",
+                  "commitSha": "$(Build.SourceVersion)",
+                  "branch": "$(Build.SourceBranchName)",
+                  "requestedBy": "$(Build.RequestedFor)",
+                  "environment": "production",
+                  "adoWorkItemUrl": "https://dev.azure.com/AtomicworkBanking/AtomBanking/_workitems"
+                }
+              waitForCompletion: 'true'
+  - deployment: DeployProd
+    displayName: 'Deploy to Production (Blue-Green)'
+    dependsOn: CreateChangeRequest
+    environment: 'production'
+    pool: { vmImage: 'ubuntu-latest' }
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "Blue-green deploy payments-api $(IMAGE_TAG) to production"
+              kubectl set image deployment/payments-api-green payments-api=atombank/payments-api:$(IMAGE_TAG) -n production
+              kubectl rollout status deployment/payments-api-green -n production
+              kubectl patch service payments-api-svc -p '{"spec":{"selector":{"slot":"green"}}}' -n production
+            displayName: 'Blue-green swap'
+          - task: InvokeRestAPI@1
+            displayName: 'Close CHG in Atomicwork'
+            inputs:
+              connectionType: connectedServiceName
+              serviceConnection: 'Atomicwork-ITSM'
+              method: PATCH
+              body: '{"status":"Closed","deployedVersion":"$(IMAGE_TAG)","deployTime":"$(date)"}'
